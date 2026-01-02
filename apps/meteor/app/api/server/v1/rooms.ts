@@ -998,6 +998,7 @@ export const roomEndpoints = API.v1
 					},
 					required: ['roles'],
 				}),
+				400: validateBadRequestErrorResponse,
 			},
 		},
 		async function () {
