@@ -1,21 +1,34 @@
 import { Logger } from '@rocket.chat/logger';
 import type { Method } from '@rocket.chat/rest-typings';
-import type { AnySchema } from 'ajv';
+import type { AnySchema, ValidateFunction } from 'ajv';
 import express from 'express';
-import type { Context, HonoRequest, MiddlewareHandler } from 'hono';
+import type { Context, Env, HonoRequest, Input, MiddlewareHandler } from 'hono';
 import { Hono } from 'hono';
 import type { StatusCode } from 'hono/utils/http-status';
 import qs from 'qs'; // Using qs specifically to keep express compatibility
+import * as z from 'zod';
 
 import type { ResponseSchema, TypedOptions } from './definition';
 import { honoAdapterForExpress } from './middlewares/honoAdapterForExpress';
 
 const logger = new Logger('HttpRouter');
 
-type MiddlewareHandlerListAndActionHandler<TOptions extends TypedOptions, TContext = (c: Context) => Promise<ResponseSchema<TOptions>>> = [
-	...MiddlewareHandler[],
-	TContext,
-];
+export type RouterContext<E extends Env = any, P extends string = any, I extends Input = NonNullable<unknown>> = Context<
+	{
+		Variables: {
+			remoteAddress: string;
+			queryParams?: unknown;
+			bodyParams?: unknown;
+		};
+	} & E,
+	P,
+	I
+>;
+
+type MiddlewareHandlerListAndActionHandler<
+	TOptions extends TypedOptions,
+	TActionHandler = (c: RouterContext) => Promise<ResponseSchema<TOptions>>,
+> = [...MiddlewareHandler[], TActionHandler];
 
 function splitArray<T, U>(arr: [...T[], U]): [T[], U] {
 	const last = arr[arr.length - 1];
@@ -74,29 +87,36 @@ export type Route = {
 	tags?: string[];
 };
 
-export abstract class AbstractRouter<TActionCallback = (c: Context) => Promise<ResponseSchema<TypedOptions>>> {
-	protected abstract convertActionToHandler(action: TActionCallback): (c: Context) => Promise<ResponseSchema<TypedOptions>>;
-}
-
 export class Router<
 	TBasePath extends string,
 	TOperations extends {
 		[x: string]: unknown;
 	} = NonNullable<unknown>,
-	TActionCallback = (c: Context) => Promise<ResponseSchema<TypedOptions>>,
-> extends AbstractRouter<TActionCallback> {
+	TActionCallback = (c: RouterContext) => Promise<ResponseSchema<TypedOptions>>,
+> {
+	protected readonly logger = logger;
+
 	protected innerRouter: Hono<{
 		Variables: {
 			remoteAddress: string;
+			queryParams?: unknown;
+			bodyParams?: unknown;
 		};
 	}>;
 
 	constructor(readonly base: TBasePath) {
-		super();
 		this.innerRouter = new Hono();
 	}
 
 	public typedRoutes: Record<string, Record<string, Route>> = {};
+
+	private extractJSONSchema(validator: ValidateFunction | z.ZodType) {
+		if ('_def' in validator) {
+			return { schema: z.toJSONSchema(validator, { target: 'openapi-3.0', io: 'input', unrepresentable: 'any' }) };
+		}
+
+		return { schema: validator.schema };
+	}
 
 	protected registerTypedRoutes<
 		TSubPathPattern extends string,
@@ -107,50 +127,54 @@ export class Router<
 		this.typedRoutes = this.typedRoutes || {};
 		this.typedRoutes[path] = this.typedRoutes[subpath] || {};
 		const { query, response = {}, authRequired, body, tags, ...rest } = options;
-		this.typedRoutes[path][method.toLowerCase()] = {
-			responses: Object.fromEntries(
-				Object.entries(response).map(([status, schema]) => [
-					parseInt(status, 10),
-					{
-						description: '',
+		try {
+			this.typedRoutes[path][method.toLowerCase()] = {
+				responses: Object.fromEntries(
+					Object.entries(response).map(([status, schema]) => [
+						parseInt(status, 10),
+						{
+							description: '',
+							content: {
+								'application/json': this.extractJSONSchema(schema),
+							},
+						},
+					]),
+				),
+				...(query && {
+					parameters: [
+						{
+							...this.extractJSONSchema(query),
+							in: 'query',
+							name: 'query',
+							required: true,
+						},
+					],
+				}),
+				...(body && {
+					requestBody: {
+						required: true,
 						content: {
-							'application/json': { schema: ('schema' in schema ? schema.schema : schema) as AnySchema },
+							'application/json': this.extractJSONSchema(body),
 						},
 					},
-				]),
-			),
-			...(query && {
-				parameters: [
-					{
-						schema: query.schema,
-						in: 'query',
-						name: 'query',
-						required: true,
-					},
-				],
-			}),
-			...(body && {
-				requestBody: {
-					required: true,
-					content: {
-						'application/json': { schema: body.schema },
-					},
-				},
-			}),
-			...(authRequired && {
-				...rest,
-				security: [
-					{
-						userId: [],
-						authToken: [],
-					},
-				],
-			}),
-			tags,
-		};
+				}),
+				...(authRequired && {
+					...rest,
+					security: [
+						{
+							userId: [],
+							authToken: [],
+						},
+					],
+				}),
+				tags,
+			};
+		} catch (e) {
+			throw new Error(`Failed to register route ${method.toUpperCase()} ${path}`, { cause: e });
+		}
 	}
 
-	protected async parseBodyParams<T extends Record<string, any>>({ request }: { request: HonoRequest; extra?: T }) {
+	protected async parseBodyParams({ request }: { request: HonoRequest }) {
 		try {
 			let parsedBody = {};
 			const contentType = request.header('content-type');
@@ -181,8 +205,48 @@ export class Router<
 		return {};
 	}
 
-	protected parseQueryParams(request: HonoRequest) {
-		return qs.parse(request.raw.url.split('?')?.[1] || '');
+	protected parseQueryParams(req: HonoRequest) {
+		return qs.parse(req.raw.url.split('?')?.[1] || '');
+	}
+
+	protected parse(
+		data: unknown,
+		validator: ValidateFunction | z.ZodType | undefined,
+		{ extendedError = false }: { extendedError?: boolean } = {},
+	): readonly [unknown, undefined] | readonly [undefined, string] {
+		if (!validator) return [data, undefined] as const;
+
+		if ('_def' in validator) {
+			const result = validator.safeParse(data);
+
+			if (!result.success) {
+				return [undefined, z.prettifyError(result.error)] as const;
+			}
+
+			return [result.data, undefined] as const;
+		}
+
+		if (typeof validator === 'function' && !validator(data)) {
+			return [
+				undefined,
+				validator.errors
+					?.map((error) =>
+						extendedError
+							? `${error.message} (${[
+									error.instancePath,
+									Object.entries(error.params)
+										.map(([key, value]) => `${key}: ${value}`)
+										.join(', '),
+								]
+									.filter(Boolean)
+									.join(' - ')})`
+							: error.message,
+					)
+					.join('\n'),
+			] as const;
+		}
+
+		return [data, undefined] as const;
 	}
 
 	protected method<TSubPathPattern extends string, TOptions extends TypedOptions>(
@@ -192,21 +256,23 @@ export class Router<
 		...actions: MiddlewareHandlerListAndActionHandler<TOptions, TActionCallback>
 	): Router<TBasePath, TOperations, TActionCallback> {
 		const [middlewares, action] = splitArray<MiddlewareHandler, TActionCallback>(actions);
-		const convertedAction = this.convertActionToHandler(action);
+		const convertedAction = this.convertActionToHandler(action, options);
 
 		this.innerRouter[method.toLowerCase() as Lowercase<Method>](`/${subpath}`.replace('//', '/'), ...middlewares, async (c) => {
 			const { req, res } = c;
 
 			const queryParams = this.parseQueryParams(req);
+			c.set('queryParams', queryParams);
 
 			if (options.query) {
-				const validatorFn = options.query;
-				if (typeof options.query === 'function' && !validatorFn(queryParams)) {
+				const [parsedQueryParams, queryValidationError] = this.parse(queryParams, options.query);
+
+				if (queryValidationError) {
 					logger.warn({
 						msg: 'Query parameters validation failed - route spec does not match request payload',
 						method: req.method,
 						path: req.url,
-						error: validatorFn.errors?.map((error: any) => error.message).join('\n '),
+						error: queryValidationError,
 						bodyParams: undefined,
 						queryParams,
 					});
@@ -214,23 +280,27 @@ export class Router<
 						{
 							success: false,
 							errorType: 'error-invalid-params',
-							error: validatorFn.errors?.map((error: any) => error.message).join('\n '),
+							error: queryValidationError,
 						},
 						400,
 					);
 				}
+
+				c.set('queryParams', parsedQueryParams);
 			}
 
 			const bodyParams = await this.parseBodyParams({ request: req });
+			c.set('bodyParams', bodyParams);
 
 			if (options.body) {
-				const validatorFn = options.body;
-				if (typeof options.body === 'function' && !validatorFn((req as any).bodyParams || bodyParams)) {
+				const [parsedBodyParams, bodyValidationError] = this.parse(bodyParams, options.body);
+
+				if (bodyValidationError) {
 					logger.warn({
 						msg: 'Request body validation failed - route spec does not match request payload',
 						method: req.method,
 						path: req.url,
-						error: validatorFn.errors?.map((error: any) => error.message).join('\n '),
+						error: bodyValidationError,
 						bodyParams,
 						queryParams: undefined,
 					});
@@ -238,11 +308,13 @@ export class Router<
 						{
 							success: false,
 							errorType: 'invalid-params',
-							error: validatorFn.errors?.map((error: any) => error.message).join('\n '),
+							error: bodyValidationError,
 						},
 						400,
 					);
 				}
+
+				c.set('bodyParams', parsedBodyParams);
 			}
 
 			const response = await convertedAction(c);
@@ -252,37 +324,30 @@ export class Router<
 				headers?: Record<string, string>;
 			};
 
+			// TODO encode response always instead of validating it in test mode
 			if (process.env.NODE_ENV === 'test' || process.env.TEST_MODE) {
-				const responseValidatorFn = options?.response?.[statusCode as keyof typeof options.response];
+				const responseSchema = options?.response?.[statusCode as keyof typeof options.response];
+
 				/* c8 ignore next 3 */
-				if (!responseValidatorFn && options.typed) {
+				if (!responseSchema && options.typed) {
 					throw new Error(`Missing response validator for endpoint ${req.method} - ${req.url} with status code ${statusCode}`);
 				}
-				if (responseValidatorFn && !responseValidatorFn(coerceDatesToStrings(body))) {
+
+				const [, responseValidationError] = this.parse(coerceDatesToStrings(body), responseSchema, { extendedError: true });
+
+				if (responseValidationError) {
 					logger.warn({
 						msg: 'Response validation failed - response does not match route spec',
 						method: req.method,
 						path: req.url,
-						error: responseValidatorFn.errors?.map((error: any) => error.message).join('\n '),
+						error: responseValidationError,
 						originalResponse: body,
 					});
 					return c.json(
 						{
 							success: false,
 							errorType: 'error-invalid-body',
-							error: `Invalid response for endpoint ${req.method} - ${req.url}. Error: ${responseValidatorFn.errors
-								?.map(
-									(error: any) =>
-										`${error.message} (${[
-											error.instancePath,
-											Object.entries(error.params)
-												.map(([key, value]) => `${key}: ${value}`)
-												.join(', '),
-										]
-											.filter(Boolean)
-											.join(' - ')})`,
-								)
-								.join('\n')}`,
+							error: `Invalid response for endpoint ${req.method} - ${req.url}. Error: ${responseValidationError}`,
 						},
 						400,
 					);
@@ -320,10 +385,13 @@ export class Router<
 		return this;
 	}
 
-	protected convertActionToHandler(action: TActionCallback): (c: Context) => Promise<ResponseSchema<TypedOptions>> {
+	protected convertActionToHandler<TOptions extends TypedOptions>(
+		action: TActionCallback,
+		_options: TOptions,
+	): (c: RouterContext) => Promise<ResponseSchema<TOptions>> {
 		// Default implementation simply passes through the action
 		// Subclasses can override this to provide custom handling
-		return action as (c: Context) => Promise<ResponseSchema<TypedOptions>>;
+		return action as (c: RouterContext) => Promise<ResponseSchema<TOptions>>;
 	}
 
 	get<TSubPathPattern extends string, TOptions extends TypedOptions, TPathPattern extends `${TBasePath}/${TSubPathPattern}`>(

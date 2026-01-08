@@ -1,11 +1,10 @@
-/* eslint-disable @typescript-eslint/naming-convention */
-import type { ResponseSchema } from '@rocket.chat/http-router';
+import type { ResponseSchema, RouterContext } from '@rocket.chat/http-router';
 import { Router } from '@rocket.chat/http-router';
-import type { Context as HonoContext } from 'hono';
 
 import type { TypedOptions } from './definition';
 
 declare module 'hono' {
+	// eslint-disable-next-line @typescript-eslint/naming-convention
 	interface ContextVariableMap {
 		'route': string;
 		'bodyParams-override'?: Record<string, any>;
@@ -31,28 +30,25 @@ export class RocketChatAPIRouter<
 		[x: string]: unknown;
 	} = NonNullable<unknown>,
 > extends Router<TBasePath, TOperations, APIActionHandler> {
-	protected override convertActionToHandler(action: APIActionHandler): (c: HonoContext) => Promise<ResponseSchema<TypedOptions>> {
-		return async (c: HonoContext): Promise<ResponseSchema<TypedOptions>> => {
-			const { req, res } = c;
-			const queryParams = this.parseQueryParams(req);
-			const bodyParams = await this.parseBodyParams<{ bodyParamsOverride: Record<string, any> }>({
-				request: req,
-				extra: { bodyParamsOverride: c.var['bodyParams-override'] || {} },
-			});
-			const request = req.raw.clone();
+	protected override convertActionToHandler<TOptions extends TypedOptions>(
+		action: APIActionHandler,
+		_options: TOptions,
+	): (c: RouterContext) => Promise<ResponseSchema<TOptions>> {
+		return async (c: RouterContext): Promise<ResponseSchema<TOptions>> => {
+			const request = c.req.raw.clone();
 
-			const context = {
+			const context: APIActionContext = {
 				requestIp: c.get('remoteAddress'),
-				urlParams: req.param(),
-				queryParams,
-				bodyParams,
+				urlParams: c.req.param(),
+				queryParams: c.get('queryParams'),
+				bodyParams: c.get('bodyParams'),
 				request,
-				path: req.path,
-				response: res,
-				route: req.routePath,
-			} as APIActionContext;
+				path: c.req.path,
+				response: c.res,
+				route: c.req.routePath,
+			};
 
-			return action.apply(context, [request]);
+			return action.apply(context, [request]) as Promise<ResponseSchema<TOptions>>;
 		};
 	}
 }
