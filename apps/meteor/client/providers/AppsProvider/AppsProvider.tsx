@@ -125,7 +125,6 @@ const AppsProvider = ({ children }: AppsProviderProps) => {
 
 	return (
 		<AppsContext.Provider
-			children={children}
 			value={{
 				installedApps: getAppState(isMarketplaceDataLoading, installedAppsData),
 				marketplaceApps: getAppState(
@@ -145,7 +144,9 @@ const AppsProvider = ({ children }: AppsProviderProps) => {
 				orchestrator: AppClientOrchestratorInstance,
 				privateAppsEnabled: (limits?.privateApps?.max ?? 0) !== 0,
 			}}
-		/>
+		>
+			{children}
+		</AppsContext.Provider>
 	);
 };
 
