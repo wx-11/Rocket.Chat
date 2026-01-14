@@ -1,4 +1,4 @@
-import { isAppLogsProps } from '@rocket.chat/rest-typings';
+import { GETAppsLogsQuerySchema } from '@rocket.chat/rest-typings';
 
 import { getPaginationItems } from '../../../../../app/api/server/helpers/getPaginationItems';
 import type { AppsRestApi } from '../rest';
@@ -7,7 +7,7 @@ import { makeAppLogsQuery } from './lib/makeAppLogsQuery';
 export const registerAppLogsHandler = ({ api, _manager, _orch }: AppsRestApi) =>
 	void api.addRoute(
 		':id/logs',
-		{ authRequired: true, permissionRequired: ['manage-apps'], validateParams: isAppLogsProps },
+		{ authRequired: true, permissionRequired: ['manage-apps'], validateParams: GETAppsLogsQuerySchema },
 		{
 			async get() {
 				const proxiedApp = _manager.getOneById(this.urlParams.id);
